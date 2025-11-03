@@ -15,6 +15,7 @@ use codex_app_server_protocol::AuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 
 use crate::LoginStatus;
+use crate::onboarding::AccountPickerWidget;
 use crate::onboarding::auth::AuthModeWidget;
 use crate::onboarding::auth::SignInState;
 use crate::onboarding::trust_directory::TrustDirectorySelection;
@@ -32,6 +33,7 @@ use std::sync::RwLock;
 enum Step {
     Windows(WindowsSetupWidget),
     Welcome(WelcomeWidget),
+    AccountPicker(AccountPickerWidget),
     Auth(AuthModeWidget),
     TrustDirectory(TrustDirectoryWidget),
 }
@@ -96,7 +98,15 @@ impl OnboardingScreen {
             !matches!(login_status, LoginStatus::NotAuthenticated),
             tui.frame_requester(),
         )));
-        if show_login_screen {
+        if config.model_provider.requires_openai_auth {
+            let sign_in_state = Arc::new(RwLock::new(SignInState::PickMode));
+            let show_login_form = Arc::new(RwLock::new(show_login_screen));
+            steps.push(Step::AccountPicker(AccountPickerWidget::new(
+                tui.frame_requester(),
+                auth_manager.clone(),
+                show_login_form.clone(),
+                sign_in_state.clone(),
+            )));
             let highlighted_mode = match forced_login_method {
                 Some(ForcedLoginMethod::Api) => AuthMode::ApiKey,
                 _ => AuthMode::ChatGPT,
@@ -105,14 +115,15 @@ impl OnboardingScreen {
                 request_frame: tui.frame_requester(),
                 highlighted_mode,
                 error: None,
-                sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
+                sign_in_state,
+                show_login_form,
                 codex_home: codex_home.clone(),
                 cli_auth_credentials_store_mode,
                 login_status,
                 auth_manager,
                 forced_chatgpt_workspace_id,
                 forced_login_method,
-            }))
+            }));
         }
         let is_git_repo = get_git_repo_root(&cwd).is_some();
         let highlighted = if is_git_repo {
@@ -322,6 +333,7 @@ impl KeyboardHandler for Step {
         match self {
             Step::Windows(widget) => widget.handle_key_event(key_event),
             Step::Welcome(widget) => widget.handle_key_event(key_event),
+            Step::AccountPicker(widget) => widget.handle_key_event(key_event),
             Step::Auth(widget) => widget.handle_key_event(key_event),
             Step::TrustDirectory(widget) => widget.handle_key_event(key_event),
         }
@@ -331,6 +343,7 @@ impl KeyboardHandler for Step {
         match self {
             Step::Windows(_) => {}
             Step::Welcome(_) => {}
+            Step::AccountPicker(_) => {}
             Step::Auth(widget) => widget.handle_paste(pasted),
             Step::TrustDirectory(widget) => widget.handle_paste(pasted),
         }
@@ -342,6 +355,7 @@ impl StepStateProvider for Step {
         match self {
             Step::Windows(w) => w.get_step_state(),
             Step::Welcome(w) => w.get_step_state(),
+            Step::AccountPicker(w) => w.get_step_state(),
             Step::Auth(w) => w.get_step_state(),
             Step::TrustDirectory(w) => w.get_step_state(),
         }
@@ -355,6 +369,9 @@ impl WidgetRef for Step {
                 widget.render_ref(area, buf);
             }
             Step::Welcome(widget) => {
+                widget.render_ref(area, buf);
+            }
+            Step::AccountPicker(widget) => {
                 widget.render_ref(area, buf);
             }
             Step::Auth(widget) => {

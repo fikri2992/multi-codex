@@ -1,5 +1,6 @@
 mod storage;
 
+use chrono::DateTime;
 use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
@@ -16,10 +17,15 @@ use std::time::Duration;
 use codex_app_server_protocol::AuthMode;
 use codex_protocol::config_types::ForcedLoginMethod;
 
+pub use crate::auth::storage::AccountKind;
+use crate::auth::storage::AccountRecord;
+use crate::auth::storage::AccountStore;
 pub use crate::auth::storage::AuthCredentialsStoreMode;
 pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
 use crate::auth::storage::create_auth_storage;
+use crate::auth::storage::load_account_store;
+use crate::auth::storage::save_account_store;
 use crate::config::Config;
 use crate::default_client::CodexHttpClient;
 use crate::token_data::PlanType;
@@ -201,6 +207,16 @@ impl CodexAuth {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSummary {
+    pub id: String,
+    pub kind: AccountKind,
+    pub label: String,
+    pub is_active: bool,
+    pub email: Option<String>,
+    pub masked_api_key: Option<String>,
+}
+
 pub const OPENAI_API_KEY_ENV_VAR: &str = "OPENAI_API_KEY";
 pub const CODEX_API_KEY_ENV_VAR: &str = "CODEX_API_KEY";
 
@@ -239,7 +255,30 @@ pub fn login_with_api_key(
         tokens: None,
         last_refresh: None,
     };
-    save_auth(codex_home, &auth_dot_json, auth_credentials_store_mode)
+    save_auth(codex_home, &auth_dot_json, auth_credentials_store_mode)?;
+    record_api_key_account(codex_home, api_key, auth_credentials_store_mode)
+}
+
+pub fn persist_chatgpt_auth(
+    codex_home: &Path,
+    api_key: Option<String>,
+    tokens: TokenData,
+    last_refresh: DateTime<Utc>,
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    let auth = AuthDotJson {
+        openai_api_key: api_key.clone(),
+        tokens: Some(tokens.clone()),
+        last_refresh: Some(last_refresh),
+    };
+    save_auth(codex_home, &auth, auth_credentials_store_mode)?;
+    record_chatgpt_account(
+        codex_home,
+        tokens,
+        api_key,
+        last_refresh,
+        auth_credentials_store_mode,
+    )
 }
 
 /// Persist the provided auth payload using the specified backend.
@@ -416,6 +455,154 @@ async fn update_tokens(
     auth_dot_json.last_refresh = Some(Utc::now());
     storage.save(&auth_dot_json)?;
     Ok(auth_dot_json)
+}
+
+fn mask_api_key(key: &str) -> String {
+    if key.len() <= 6 {
+        return "***".to_string();
+    }
+
+    let suffix: String = key
+        .chars()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    if key.starts_with("sk-") {
+        format!("sk-***{suffix}")
+    } else {
+        format!("***{suffix}")
+    }
+}
+
+fn account_label(record: &AccountRecord) -> String {
+    if let Some(label) = &record.label {
+        return label.clone();
+    }
+
+    match record.kind {
+        AccountKind::ChatGpt => record
+            .tokens
+            .as_ref()
+            .and_then(|t| t.id_token.email.clone())
+            .unwrap_or_else(|| "ChatGPT account".to_string()),
+        AccountKind::ApiKey => "API key".to_string(),
+    }
+}
+
+fn summarize_account(record: &AccountRecord, active_id: Option<&str>) -> AccountSummary {
+    AccountSummary {
+        id: record.id.clone(),
+        kind: record.kind,
+        label: account_label(record),
+        is_active: active_id.is_some_and(|id| id == record.id.as_str()),
+        email: record
+            .tokens
+            .as_ref()
+            .and_then(|t| t.id_token.email.clone()),
+        masked_api_key: record.openai_api_key.as_deref().map(mask_api_key),
+    }
+}
+
+fn upsert_account_record(store: &mut AccountStore, record: AccountRecord) -> String {
+    if let Some(existing) = store.accounts.iter_mut().find(|acc| acc.id == record.id) {
+        *existing = record;
+        existing.id.clone()
+    } else {
+        let id = record.id.clone();
+        store.accounts.push(record);
+        id
+    }
+}
+
+fn find_existing_chatgpt_record<'a>(
+    store: &'a mut AccountStore,
+    tokens: &TokenData,
+) -> Option<&'a mut AccountRecord> {
+    let target_account = tokens
+        .account_id
+        .clone()
+        .or_else(|| tokens.id_token.chatgpt_account_id.clone());
+    let target_email = tokens.id_token.email.as_ref();
+
+    store.accounts.iter_mut().find(|record| {
+        if record.kind != AccountKind::ChatGpt {
+            return false;
+        }
+        if let Some(existing_tokens) = &record.tokens {
+            let existing_account = existing_tokens
+                .account_id
+                .clone()
+                .or_else(|| existing_tokens.id_token.chatgpt_account_id.clone());
+            if let (Some(target), Some(existing)) = (&target_account, existing_account)
+                && target == &existing {
+                    return true;
+                }
+            if let (Some(target_email), Some(existing_email)) =
+                (target_email, existing_tokens.id_token.email.as_ref())
+                && target_email == existing_email {
+                    return true;
+                }
+        }
+        false
+    })
+}
+
+fn record_api_key_account(
+    codex_home: &Path,
+    api_key: &str,
+    mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    let mut store = load_account_store(codex_home, mode)?;
+    let mut record = store
+        .accounts
+        .iter()
+        .find(|acc| {
+            acc.kind == AccountKind::ApiKey && acc.openai_api_key.as_deref() == Some(api_key)
+        })
+        .cloned()
+        .unwrap_or_else(|| AccountRecord::new(AccountKind::ApiKey));
+
+    record.openai_api_key = Some(api_key.to_string());
+    record.tokens = None;
+    record.last_refresh = None;
+    if record.label.is_none() {
+        record.label = Some("API key".to_string());
+    }
+
+    let id = upsert_account_record(&mut store, record);
+    store.active_account_id = Some(id);
+    save_account_store(codex_home, mode, &store)
+}
+
+fn record_chatgpt_account(
+    codex_home: &Path,
+    tokens: TokenData,
+    api_key: Option<String>,
+    last_refresh: DateTime<Utc>,
+    mode: AuthCredentialsStoreMode,
+) -> std::io::Result<()> {
+    let mut store = load_account_store(codex_home, mode)?;
+
+    let mut record = find_existing_chatgpt_record(&mut store, &tokens)
+        .cloned()
+        .unwrap_or_else(|| AccountRecord::new(AccountKind::ChatGpt));
+
+    record.kind = AccountKind::ChatGpt;
+    record.tokens = Some(tokens.clone());
+    record.openai_api_key = api_key;
+    record.last_refresh = Some(last_refresh);
+    let email = tokens.id_token.email.clone();
+    if email.is_some() {
+        record.label = email;
+    }
+
+    let id = upsert_account_record(&mut store, record);
+    store.active_account_id = Some(id);
+    save_account_store(codex_home, mode, &store)
 }
 
 async fn try_refresh_token(
@@ -878,6 +1065,38 @@ pub struct AuthManager {
 }
 
 impl AuthManager {
+    fn ensure_account_store_initialized(&self) -> std::io::Result<()> {
+        let mut store = load_account_store(&self.codex_home, self.auth_credentials_store_mode)?;
+        if !store.accounts.is_empty() {
+            return Ok(());
+        }
+
+        if let Some(auth) = load_auth_dot_json(&self.codex_home, self.auth_credentials_store_mode)?
+        {
+            if auth.openai_api_key.is_none() && auth.tokens.is_none() {
+                return Ok(());
+            }
+
+            let kind = AccountKind::from_tokens(&auth.tokens);
+            let mut record = AccountRecord::new(kind);
+            record.openai_api_key = auth.openai_api_key.clone();
+            record.tokens = auth.tokens.clone();
+            record.last_refresh = auth.last_refresh;
+            if let Some(tokens) = &record.tokens
+                && let Some(email) = tokens.id_token.email.clone() {
+                    record.label = Some(email);
+                }
+            if kind == AccountKind::ApiKey {
+                record.label.get_or_insert_with(|| "API key".to_string());
+            }
+            let id = upsert_account_record(&mut store, record);
+            store.active_account_id = Some(id);
+            save_account_store(&self.codex_home, self.auth_credentials_store_mode, &store)?;
+        }
+
+        Ok(())
+    }
+
     /// Create a new manager loading the initial auth using the provided
     /// preferred auth method. Errors loading auth are swallowed; `auth()` will
     /// simply return `None` in that case so callers can treat it as an
@@ -987,5 +1206,38 @@ impl AuthManager {
         // Always reload to clear any cached auth (even if file absent).
         self.reload();
         Ok(removed)
+    }
+
+    pub fn list_accounts(&self) -> std::io::Result<Vec<AccountSummary>> {
+        self.ensure_account_store_initialized()?;
+        let store = load_account_store(&self.codex_home, self.auth_credentials_store_mode)?;
+        let active_id = store.active_account_id.as_deref();
+        Ok(store
+            .accounts
+            .iter()
+            .map(|record| summarize_account(record, active_id))
+            .collect())
+    }
+
+    pub fn select_account(&self, account_id: &str) -> std::io::Result<()> {
+        self.ensure_account_store_initialized()?;
+        let mut store = load_account_store(&self.codex_home, self.auth_credentials_store_mode)?;
+        let record = store
+            .accounts
+            .iter()
+            .find(|acc| acc.id == account_id)
+            .cloned()
+            .ok_or_else(|| std::io::Error::other("Account not found"))?;
+
+        let auth = AuthDotJson {
+            openai_api_key: record.openai_api_key.clone(),
+            tokens: record.tokens.clone(),
+            last_refresh: record.last_refresh,
+        };
+        save_auth(&self.codex_home, &auth, self.auth_credentials_store_mode)?;
+        store.active_account_id = Some(record.id);
+        save_account_store(&self.codex_home, self.auth_credentials_store_mode, &store)?;
+        self.reload();
+        Ok(())
     }
 }
