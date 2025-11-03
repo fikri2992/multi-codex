@@ -77,6 +77,14 @@ impl Drop for ContinueInBrowserState {
 
 impl KeyboardHandler for AuthModeWidget {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
+        if self
+            .show_login_form
+            .read()
+            .map(|flag| !*flag)
+            .unwrap_or(false)
+        {
+            return;
+        }
         if self.handle_api_key_entry_key_event(&key_event) {
             return;
         }
@@ -138,6 +146,14 @@ impl KeyboardHandler for AuthModeWidget {
     }
 
     fn handle_paste(&mut self, pasted: String) {
+        if self
+            .show_login_form
+            .read()
+            .map(|flag| !*flag)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let _ = self.handle_api_key_entry_paste(pasted);
     }
 }
@@ -148,6 +164,7 @@ pub(crate) struct AuthModeWidget {
     pub highlighted_mode: AuthMode,
     pub error: Option<String>,
     pub sign_in_state: Arc<RwLock<SignInState>>,
+    pub show_login_form: Arc<RwLock<bool>>,
     pub codex_home: PathBuf,
     pub cli_auth_credentials_store_mode: AuthCredentialsStoreMode,
     pub login_status: LoginStatus,
@@ -604,6 +621,14 @@ impl AuthModeWidget {
 
 impl StepStateProvider for AuthModeWidget {
     fn get_step_state(&self) -> StepState {
+        if self
+            .show_login_form
+            .read()
+            .map(|flag| !*flag)
+            .unwrap_or(false)
+        {
+            return StepState::Hidden;
+        }
         let sign_in_state = self.sign_in_state.read().unwrap();
         match &*sign_in_state {
             SignInState::PickMode
@@ -657,6 +682,7 @@ mod tests {
             highlighted_mode: AuthMode::ChatGPT,
             error: None,
             sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
+            show_login_form: Arc::new(RwLock::new(true)),
             codex_home: codex_home_path.clone(),
             cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
             login_status: LoginStatus::NotAuthenticated,
