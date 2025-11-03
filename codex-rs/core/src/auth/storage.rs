@@ -15,6 +15,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::token_data::TokenData;
 use codex_keyring_store::DefaultKeyringStore;
@@ -46,6 +47,68 @@ pub struct AuthDotJson {
     pub last_refresh: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountKind {
+    ApiKey,
+    ChatGpt,
+}
+
+impl AccountKind {
+    pub fn from_tokens(tokens: &Option<TokenData>) -> Self {
+        if tokens.is_some() {
+            AccountKind::ChatGpt
+        } else {
+            AccountKind::ApiKey
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
+pub struct AccountRecord {
+    pub id: String,
+
+    pub kind: AccountKind,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    #[serde(
+        rename = "OPENAI_API_KEY",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub openai_api_key: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenData>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<DateTime<Utc>>,
+}
+
+impl AccountRecord {
+    pub fn new(kind: AccountKind) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            kind,
+            label: None,
+            openai_api_key: None,
+            tokens: None,
+            last_refresh: None,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Default)]
+pub struct AccountStore {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accounts: Vec<AccountRecord>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_account_id: Option<String>,
+}
+
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
 }
@@ -63,6 +126,11 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>>;
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()>;
     fn delete(&self) -> std::io::Result<bool>;
+}
+
+pub(super) trait AccountStorageBackend: Debug + Send + Sync {
+    fn load(&self) -> std::io::Result<AccountStore>;
+    fn save(&self, store: &AccountStore) -> std::io::Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +187,55 @@ impl AuthStorageBackend for FileAuthStorage {
 
     fn delete(&self) -> std::io::Result<bool> {
         delete_file_if_exists(&self.codex_home)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct FileAccountStorage {
+    codex_home: PathBuf,
+}
+
+impl FileAccountStorage {
+    pub fn new(codex_home: PathBuf) -> Self {
+        Self { codex_home }
+    }
+
+    fn get_accounts_file(&self) -> PathBuf {
+        self.codex_home.join("accounts.json")
+    }
+}
+
+impl AccountStorageBackend for FileAccountStorage {
+    fn load(&self) -> std::io::Result<AccountStore> {
+        let path = self.get_accounts_file();
+        match File::open(&path) {
+            Ok(mut file) => {
+                let mut contents = String::new();
+                file.read_to_string(&mut contents)?;
+                let store: AccountStore = serde_json::from_str(&contents)?;
+                Ok(store)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(AccountStore::default()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn save(&self, store: &AccountStore) -> std::io::Result<()> {
+        let path = self.get_accounts_file();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json_data = serde_json::to_string_pretty(store)?;
+        let mut options = OpenOptions::new();
+        options.truncate(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(json_data.as_bytes())?;
+        file.flush()?;
+        Ok(())
     }
 }
 
@@ -213,6 +330,65 @@ impl AuthStorageBackend for KeyringAuthStorage {
 }
 
 #[derive(Clone, Debug)]
+struct KeyringAccountStorage {
+    codex_home: PathBuf,
+    keyring_store: Arc<dyn KeyringStore>,
+}
+
+impl KeyringAccountStorage {
+    fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
+        Self {
+            codex_home,
+            keyring_store,
+        }
+    }
+
+    fn load_from_keyring(&self, key: &str) -> std::io::Result<AccountStore> {
+        match self.keyring_store.load(KEYRING_SERVICE, key) {
+            Ok(Some(serialized)) => serde_json::from_str(&serialized).map_err(|err| {
+                std::io::Error::other(format!(
+                    "failed to deserialize accounts from keyring: {err}"
+                ))
+            }),
+            Ok(None) => Ok(AccountStore::default()),
+            Err(error) => Err(std::io::Error::other(format!(
+                "failed to load accounts from keyring: {}",
+                error.message()
+            ))),
+        }
+    }
+
+    fn save_to_keyring(&self, key: &str, value: &str) -> std::io::Result<()> {
+        match self.keyring_store.save(KEYRING_SERVICE, key, value) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(std::io::Error::other(format!(
+                "failed to write accounts to keyring: {}",
+                error.message()
+            ))),
+        }
+    }
+}
+
+impl AccountStorageBackend for KeyringAccountStorage {
+    fn load(&self) -> std::io::Result<AccountStore> {
+        let key = format!("{}|accounts", compute_store_key(&self.codex_home)?);
+        self.load_from_keyring(&key)
+    }
+
+    fn save(&self, store: &AccountStore) -> std::io::Result<()> {
+        let key = format!("{}|accounts", compute_store_key(&self.codex_home)?);
+        let serialized = serde_json::to_string(store).map_err(std::io::Error::other)?;
+        self.save_to_keyring(&key, &serialized)?;
+        let file_path = self.codex_home.join("accounts.json");
+        if let Err(err) = std::fs::remove_file(&file_path)
+            && err.kind() != std::io::ErrorKind::NotFound {
+                warn!("failed to remove CLI accounts fallback file: {err}");
+            }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
 struct AutoAuthStorage {
     keyring_storage: Arc<KeyringAuthStorage>,
     file_storage: Arc<FileAuthStorage>,
@@ -255,6 +431,43 @@ impl AuthStorageBackend for AutoAuthStorage {
     }
 }
 
+#[derive(Clone, Debug)]
+struct AutoAccountStorage {
+    file_storage: FileAccountStorage,
+    keyring_storage: KeyringAccountStorage,
+}
+
+impl AutoAccountStorage {
+    fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
+        Self {
+            file_storage: FileAccountStorage::new(codex_home.clone()),
+            keyring_storage: KeyringAccountStorage::new(codex_home, keyring_store),
+        }
+    }
+}
+
+impl AccountStorageBackend for AutoAccountStorage {
+    fn load(&self) -> std::io::Result<AccountStore> {
+        match self.keyring_storage.load() {
+            Ok(store) => Ok(store),
+            Err(err) => {
+                warn!("Failed to load accounts from keyring: {err}. Falling back to file.");
+                self.file_storage.load()
+            }
+        }
+    }
+
+    fn save(&self, store: &AccountStore) -> std::io::Result<()> {
+        match self.keyring_storage.save(store) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!("Failed to save accounts to keyring: {err}. Falling back to file.");
+                self.file_storage.save(store)
+            }
+        }
+    }
+}
+
 pub(super) fn create_auth_storage(
     codex_home: PathBuf,
     mode: AuthCredentialsStoreMode,
@@ -275,6 +488,39 @@ fn create_auth_storage_with_keyring_store(
         }
         AuthCredentialsStoreMode::Auto => Arc::new(AutoAuthStorage::new(codex_home, keyring_store)),
     }
+}
+
+pub(super) fn create_account_storage(
+    codex_home: PathBuf,
+    mode: AuthCredentialsStoreMode,
+) -> Arc<dyn AccountStorageBackend> {
+    let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
+    match mode {
+        AuthCredentialsStoreMode::File => Arc::new(FileAccountStorage::new(codex_home)),
+        AuthCredentialsStoreMode::Keyring => {
+            Arc::new(KeyringAccountStorage::new(codex_home, keyring_store))
+        }
+        AuthCredentialsStoreMode::Auto => {
+            Arc::new(AutoAccountStorage::new(codex_home, keyring_store))
+        }
+    }
+}
+
+pub(super) fn load_account_store(
+    codex_home: &Path,
+    mode: AuthCredentialsStoreMode,
+) -> std::io::Result<AccountStore> {
+    let storage = create_account_storage(codex_home.to_path_buf(), mode);
+    storage.load()
+}
+
+pub(super) fn save_account_store(
+    codex_home: &Path,
+    mode: AuthCredentialsStoreMode,
+    store: &AccountStore,
+) -> std::io::Result<()> {
+    let storage = create_account_storage(codex_home.to_path_buf(), mode);
+    storage.save(store)
 }
 
 #[cfg(test)]
